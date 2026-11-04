@@ -22,6 +22,7 @@ from android_utils import run_on_ui_thread, log  # type: ignore
 from client_utils import get_last_fragment  # type: ignore
 from ui.settings import Header, Switch, Text, Divider  # type: ignore
 from typing import Any, List
+import json
 
 __id__ = "material_u"
 __name__ = "Material U — Pixel clean UI"
@@ -30,7 +31,7 @@ __description__ = (
     "показує, чи зміни реально зберігаються (результат у буфері + тост)."
 )
 __author__ = "Danylo"
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.0.0"
 __app_version__ = ">=11.0.0"
@@ -340,6 +341,46 @@ class MaterialUPlugin(BasePlugin):
         body = "\n".join(rows) if rows else f"(порожньо) помилка рефлексії: {err}"
         self._report(f"Поля ExteraConfig ({len(rows)})", body)
 
+    def _snapshot_map(self):
+        """Current primitive config as a plain dict (bool/int/float only)."""
+        prefs = self._prefs()
+        data = {}
+        if prefs is None:
+            return data
+        try:
+            for e in prefs.getAll().entrySet().toArray():
+                v = e.getValue()
+                if isinstance(v, (bool, int, float)):
+                    data[str(e.getKey())] = v
+        except Exception as ex:  # noqa: BLE001
+            self.logger.exception(f"snapshot failed: {ex}")
+        return data
+
+    def _snapshot(self, *_):
+        data = self._snapshot_map()
+        try:
+            self.set_setting("mu_snapshot", json.dumps(data), False)
+        except Exception as ex:  # noqa: BLE001
+            self.logger.exception(f"save snapshot failed: {ex}")
+        self._bulletin(f"Знімок збережено: {len(data)} ключів. "
+                       f"Тепер перемкни опцію в Appearance і тисни «Порівняти».", "success")
+
+    def _diff(self, *_):
+        try:
+            old = json.loads(self.get_setting("mu_snapshot", "{}"))
+        except Exception:  # noqa: BLE001
+            old = {}
+        cur = self._snapshot_map()
+        changed = []
+        for k in sorted(set(old) | set(cur), key=str.lower):
+            ov, cv = old.get(k, "∅"), cur.get(k, "∅")
+            if ov != cv:
+                changed.append(f"{k}: {ov} → {cv}")
+        body = "\n".join(changed) if changed else "(нічого не змінилось)"
+        text = ("ЗМІНИ після знімка (це і є справжні ключі опцій, які ти перемкнув):\n\n"
+                + body)
+        self._report("Diff", text, summary=f"Diff: {len(changed)} змін — у буфері")
+
     def _diag_summary(self, *_):
         """Compact state of our target keys + whether the config class is reachable.
         Tap this AFTER a restart to see if the values survived (revert diagnosis)."""
@@ -416,6 +457,13 @@ class MaterialUPlugin(BasePlugin):
                    default=self._get_bool("squareFab", True), icon="msg_edit",
                    on_change=self._changer("squareFab")),
             Divider(),
+
+            Header(text="Знайти справжні ключі (diff)"),
+            Text(text="📸 1. Зберегти знімок ключів", icon="msg_info",
+                 on_click=self._snapshot),
+            Text(text="🔬 2. Порівняти (після зміни опції в Appearance)", icon="msg_settings",
+                 on_click=self._diff),
+            Divider(text="Знімок → перемкни опцію M3/острівці в exteraGram Appearance → Порівняти."),
 
             Header(text="Діагностика"),
             Text(text="🔁 Стан наших ключів (тисни після перезапуску)", icon="msg_info",
