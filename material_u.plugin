@@ -1,14 +1,15 @@
 """
 Material U — Pixel clean UI for exteraGram.
 
-A thin "switcher" plugin: it does NOT hand-draw a new UI (that would be brittle and
-break on every app update). Instead it flips exteraGram's own appearance flags toward a
-Material-You look (M3 on; liquid glass / blur / glare off) and ships a diagnostic that
-dumps the real config keys AND field types of THIS installed version.
+A thin "switcher" plugin: it does NOT hand-draw a new UI (too brittle). It flips
+exteraGram's own appearance flags toward a Material-You look (M3 on; liquid glass /
+blur / glare off) and ships diagnostics that read the real config of THIS device.
 
-Keys below were confirmed from a real device dump (exteraGram v12+). Writes are
-TYPE-SAFE: the field's declared Java type is read via reflection first, so we never
-store a boolean into an int key (which would crash the app on read).
+v1.2.0 — writes are now SELF-VERIFYING: every write reads the value back and the
+result dialog shows `wrote -> now`, so we can see on-device whether persistence works.
+Prefs are taken from the app Context (ApplicationLoader) for reliability, and field
+types are resolved from Java reflection first, then the stored value's class, then a
+known map — so we never store the wrong type into a key (which could crash the app).
 """
 
 from base_plugin import BasePlugin  # type: ignore
@@ -22,31 +23,46 @@ from typing import Any, List
 __id__ = "material_u"
 __name__ = "Material U — Pixel clean UI"
 __description__ = (
-    "Material You (M3) увімкнено, liquid glass / блюр / відблиски вимкнено. "
-    "Містить діагностику з реальними ключами й типами полів твоєї версії."
+    "Material You (M3) увімк., liquid glass / блюр / відблиски вимк. Самотест запису "
+    "показує, чи зміни реально зберігаються."
 )
 __author__ = "Danylo"
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.0.0"
 __app_version__ = ">=11.0.0"
 __sdk_version__ = ">=1.0.0"
 
 EXTERA_CONFIG = "com.exteragram.messenger.ExteraConfig"
-
+PREFS_NAME = "exteraconfig"
 PRIMITIVES = {"boolean", "int", "long", "float", "double"}
 
+# Fallback type map (used only if reflection + stored-value typing both fail).
+TYPE_MAP = {
+    "md3Styles": "boolean",
+    "forceBlur": "boolean",
+    "forceSnow": "boolean",
+    "glassMessageMenu": "boolean",
+    "glareOnElements": "boolean",
+    "blurActionBar": "boolean",
+    "blurBottomPanel": "boolean",
+    "blurDialogs": "boolean",
+    "squareFab": "boolean",
+    "glassOutlineStyle": "int",
+    "sectionRadius": "float",
+    "avatarCorners": "float",
+}
+
 # Material-You preset, keyed by REAL field names from the device dump.
-# Value is the desired state; it is coerced to the field's actual type at write time.
 PRESET = [
-    ("md3Styles", True),         # master Material 3 styles
-    ("forceBlur", False),        # liquid glass blur off
+    ("md3Styles", True),
+    ("forceBlur", False),
     ("blurActionBar", False),
     ("blurBottomPanel", False),
     ("blurDialogs", False),
-    ("glassMessageMenu", False), # liquid glass message menu off
-    ("glareOnElements", False),  # glass glare off
-    ("forceSnow", False),        # seasonal snow off
+    ("glassMessageMenu", False),
+    ("glareOnElements", False),
+    ("forceSnow", False),
 ]
 
 
@@ -54,23 +70,39 @@ class MaterialUPlugin(BasePlugin):
 
     # ------------------------------------------------------------------ config
     def _cls(self):
-        c = find_class(EXTERA_CONFIG)
-        if c is None:
-            self.logger.error("ExteraConfig not found — wrong app/version?")
-        return c
+        return find_class(EXTERA_CONFIG)
 
     def _prefs(self):
-        c = self._cls()
-        if c is None:
-            return None
+        """SharedPreferences('exteraconfig') from the app Context (most reliable)."""
         try:
-            return get_static_private_field(c, "preferences")
+            al = find_class("org.telegram.messenger.ApplicationLoader")
+            ctx = get_static_private_field(al, "applicationContext")
+            if ctx is not None:
+                return ctx.getSharedPreferences(PREFS_NAME, 0)  # MODE_PRIVATE
         except Exception as e:  # noqa: BLE001
-            self.logger.exception(f"reading preferences failed: {e}")
+            self.logger.warning(f"context prefs failed, falling back: {e}")
+        c = self._cls()
+        try:
+            return get_static_private_field(c, "preferences") if c else None
+        except Exception:  # noqa: BLE001
             return None
 
-    def _field_type(self, name: str):
-        """Declared Java type of an ExteraConfig field, or None if absent here."""
+    def _stored_type(self, prefs, name):
+        try:
+            val = prefs.getAll().get(name)
+        except Exception:  # noqa: BLE001
+            return None
+        if val is None:
+            return None
+        cn = str(val.getClass().getName())
+        return {
+            "java.lang.Boolean": "boolean",
+            "java.lang.Integer": "int",
+            "java.lang.Long": "long",
+            "java.lang.Float": "float",
+        }.get(cn)
+
+    def _reflect_type(self, name):
         c = self._cls()
         if c is None:
             return None
@@ -79,7 +111,13 @@ class MaterialUPlugin(BasePlugin):
         except Exception:  # noqa: BLE001
             return None
 
-    def _get_static(self, name: str, default=None):
+    def _type_of(self, prefs, name):
+        # reflection is authoritative; then stored value's class; then known map
+        return (self._reflect_type(name)
+                or self._stored_type(prefs, name)
+                or TYPE_MAP.get(name))
+
+    def _get_static(self, name, default=None):
         c = self._cls()
         if c is None:
             return default
@@ -88,7 +126,7 @@ class MaterialUPlugin(BasePlugin):
         except Exception:  # noqa: BLE001
             return default
 
-    def _get_bool(self, name: str, default: bool = False) -> bool:
+    def _get_bool(self, name, default=False):
         val = self._get_static(name, None)
         if isinstance(val, bool):
             return val
@@ -96,16 +134,14 @@ class MaterialUPlugin(BasePlugin):
             return val != 0
         return default
 
-    def _set_flag(self, name: str, value) -> str:
-        """Type-safe write: pref + live static field. Returns ok / skip / error."""
-        c = self._cls()
+    def _set_flag(self, name, value):
+        """Type-safe write + read-back. Returns a dict for the self-test dialog."""
         prefs = self._prefs()
-        if c is None or prefs is None:
-            return "error"
-        ftype = self._field_type(name)
+        if prefs is None:
+            return {"name": name, "status": "no-prefs"}
+        ftype = self._type_of(prefs, name)
         if ftype not in PRIMITIVES:
-            # field does not exist on this version — skip safely, never guess a type
-            return "skip"
+            return {"name": name, "status": "skip (no field)"}
         try:
             editor = prefs.edit()
             if ftype == "boolean":
@@ -117,26 +153,42 @@ class MaterialUPlugin(BasePlugin):
             elif ftype == "long":
                 conv = int(value)
                 editor.putLong(name, conv)
-            else:  # float / double
+            else:
                 conv = float(value)
                 editor.putFloat(name, conv)
-            editor.apply()
+            editor.commit()  # commit (sync) so read-back below is accurate
         except Exception as e:  # noqa: BLE001
             self.logger.exception(f"put '{name}' failed: {e}")
-            return "error"
+            return {"name": name, "status": f"error {e}"}
+        # read back from prefs
         try:
-            set_static_private_field(c, name, conv)
-        except Exception as e:  # noqa: BLE001
-            self.logger.warning(f"static '{name}' not live-updated: {e}")
-        return "ok"
+            if ftype == "boolean":
+                now = prefs.getBoolean(name, not conv)
+            elif ftype == "int":
+                now = prefs.getInt(name, -999999)
+            elif ftype == "long":
+                now = prefs.getLong(name, -999999)
+            else:
+                now = prefs.getFloat(name, -999999.0)
+        except Exception:  # noqa: BLE001
+            now = "?"
+        # live static field so it also affects the running session
+        c = self._cls()
+        if c is not None:
+            try:
+                set_static_private_field(c, name, conv)
+            except Exception as e:  # noqa: BLE001
+                self.logger.warning(f"static '{name}' not updated: {e}")
+        ok = (now == conv)
+        return {"name": name, "type": ftype, "wrote": conv, "now": now,
+                "status": "ok" if ok else "MISMATCH"}
 
-    def _refresh_ui(self) -> None:
+    def _refresh_ui(self):
         try:
             from client_utils import get_notification_center  # type: ignore
             nc = find_class("org.telegram.messenger.NotificationCenter")
             get_notification_center().postNotificationName(
-                get_static_private_field(nc, "mainUserInfoChanged"), []
-            )
+                get_static_private_field(nc, "mainUserInfoChanged"), [])
         except Exception as e:  # noqa: BLE001
             self.logger.debug(f"refresh skipped: {e}")
 
@@ -145,40 +197,59 @@ class MaterialUPlugin(BasePlugin):
         try:
             prefs = self._prefs()
             n = len(prefs.getAll()) if prefs is not None else 0
-            self.logger.info(f"Material U loaded; {n} exteraGram keys present")
+            self.logger.info(f"Material U {__version__}; {n} keys; prefs={prefs}")
         except Exception as e:  # noqa: BLE001
-            self.logger.exception(f"load dump failed: {e}")
+            self.logger.exception(f"load check failed: {e}")
 
     # ----------------------------------------------------------------- actions
     def _apply_preset(self, *_):
-        applied, skipped = [], []
-        for name, want in PRESET:
-            res = self._set_flag(name, want)
-            if res == "ok":
-                applied.append(f"{name} -> {want}")
-            elif res == "skip":
-                skipped.append(name)
+        results = [self._set_flag(n, v) for n, v in PRESET]
         self._refresh_ui()
-        msg = ""
-        if applied:
-            msg += "Застосовано:\n• " + "\n• ".join(applied) + "\n\n"
-        if skipped:
-            msg += "Немає у цій версії (пропущено): " + ", ".join(skipped) + "\n\n"
-        msg += "⚠️ Повністю перезапусти exteraGram (змах із недавніх), щоб побачити зміни блюру/M3."
-        self._show_dialog("Material U", msg)
+        lines = []
+        for r in results:
+            if r["status"] == "ok":
+                lines.append(f"✓ {r['name']}: → {r['wrote']}")
+            elif r["status"] == "MISMATCH":
+                lines.append(f"✗ {r['name']}: записав {r['wrote']}, читається {r['now']}")
+            else:
+                lines.append(f"• {r['name']}: {r['status']}")
+        msg = ("САМОТЕСТ ЗАПИСУ (✓ = збережено, ✗ = не зберігається, "
+               "• = поля нема/помилка):\n\n" + "\n".join(lines) +
+               "\n\n⚠️ Якщо всюди ✓ — повністю перезапусти exteraGram, щоб побачити UI.\n"
+               "Якщо є ✗ або • — надішли цей екран, лагодитиму запис.")
+        self._show_dialog("Material U — self-test", msg)
 
-    def _toggle_sections_flat(self, flat: bool):
-        # Material "islands" rounding lives in sectionRadius (float). 0 = flat corners.
+    def _toggle_sections_flat(self, flat):
         self._set_flag("sectionRadius", 0.0 if flat else 17.0)
         self._refresh_ui()
 
-    def _changer(self, name: str):
-        def _cb(new_value: bool):
+    def _changer(self, name):
+        def _cb(new_value):
             self._set_flag(name, bool(new_value))
             self._refresh_ui()
         return _cb
 
     # -------------------------------------------------------------- diagnostics
+    def _show_fields(self, *_):
+        c = self._cls()
+        if c is None:
+            self._show_dialog("Material U", "ExteraConfig не знайдено.")
+            return
+        rows, err = [], None
+        try:
+            for f in c.getDeclaredFields():
+                tp = str(f.getType().getName())
+                if tp not in PRIMITIVES:
+                    continue
+                nm = str(f.getName())
+                rows.append(f"{nm}: {tp} = {self._get_static(nm, '?')}")
+        except Exception as ex:  # noqa: BLE001
+            err = str(ex)
+            self.logger.exception(f"fields dump failed: {ex}")
+        rows.sort(key=str.lower)
+        body = "\n".join(rows) if rows else f"(порожньо) помилка: {err}"
+        self._show_dialog(f"Поля ExteraConfig ({len(rows)})", body)
+
     def _show_keys(self, *_):
         prefs = self._prefs()
         if prefs is None:
@@ -187,50 +258,28 @@ class MaterialUPlugin(BasePlugin):
         rows = []
         try:
             for e in prefs.getAll().entrySet().toArray():
-                v = e.getValue()
-                sv = repr(v)
-                if len(sv) > 80:
-                    sv = sv[:77] + "…"
+                sv = repr(e.getValue())
+                if len(sv) > 70:
+                    sv = sv[:67] + "…"
                 rows.append(f"{e.getKey()} = {sv}")
         except Exception as ex:  # noqa: BLE001
             self.logger.exception(f"getAll failed: {ex}")
         rows.sort(key=str.lower)
         self._show_dialog(f"Ключі ({len(rows)})", "\n".join(rows))
 
-    def _show_fields(self, *_):
-        """Definitive list: every primitive ExteraConfig field as name: type = value."""
-        c = self._cls()
-        if c is None:
-            self._show_dialog("Material U", "ExteraConfig не знайдено.")
-            return
-        rows = []
-        try:
-            for f in c.getDeclaredFields():
-                tp = str(f.getType().getName())
-                if tp not in PRIMITIVES:
-                    continue
-                name = str(f.getName())
-                rows.append(f"{name}: {tp} = {self._get_static(name, '?')}")
-        except Exception as ex:  # noqa: BLE001
-            self.logger.exception(f"fields dump failed: {ex}")
-        rows.sort(key=str.lower)
-        self._show_dialog(f"Поля ExteraConfig ({len(rows)})", "\n".join(rows))
-
     def _copy_keys(self, *_):
         prefs = self._prefs()
         if prefs is None:
             return
         try:
-            text = "\n".join(
-                f"{e.getKey()} = {e.getValue()!r}"
-                for e in prefs.getAll().entrySet().toArray()
-            )
+            text = "\n".join(f"{e.getKey()} = {e.getValue()!r}"
+                             for e in prefs.getAll().entrySet().toArray())
             from android_utils import copy_to_clipboard  # type: ignore
             copy_to_clipboard(text)
         except Exception as ex:  # noqa: BLE001
             self.logger.exception(f"copy failed: {ex}")
 
-    def _show_dialog(self, title: str, message: str):
+    def _show_dialog(self, title, message):
         def _show():
             fragment = get_last_fragment()
             activity = fragment.getParentActivity() if fragment else None
@@ -248,9 +297,9 @@ class MaterialUPlugin(BasePlugin):
     def create_settings(self) -> List[Any]:
         return [
             Header(text="Material You"),
-            Text(text="✨ Застосувати пресет Material You", icon="msg_theme",
+            Text(text="✨ Застосувати пресет (самотест)", icon="msg_theme",
                  on_click=self._apply_preset),
-            Divider(text="M3 увімк., скло/блюр/сніг вимк. Потрібен повний перезапуск exteraGram."),
+            Divider(text="Пише ключі й одразу перевіряє. Потім повний перезапуск exteraGram."),
 
             Header(text="Material 3"),
             Switch(key="mu_md3Styles", text="Material 3 стиль (M3)",
@@ -287,5 +336,4 @@ class MaterialUPlugin(BasePlugin):
                  on_click=self._show_keys),
             Text(text="📋 Скопіювати ключі в буфер", icon="msg_copy",
                  on_click=self._copy_keys),
-            Divider(text="Надішли «Поля ExteraConfig», щоб доточити острівці/вкладки точно."),
         ]
