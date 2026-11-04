@@ -30,7 +30,7 @@ __description__ = (
     "показує, чи зміни реально зберігаються (результат у буфері + тост)."
 )
 __author__ = "Danylo"
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.0.0"
 __app_version__ = ">=11.0.0"
@@ -100,10 +100,22 @@ class MaterialUPlugin(BasePlugin):
             return None
         if val is None:
             return None
-        return {
-            "java.lang.Boolean": "boolean", "java.lang.Integer": "int",
-            "java.lang.Long": "long", "java.lang.Float": "float",
-        }.get(str(val.getClass().getName()))
+        # Chaquopy converts Java Boolean/Integer/Long/Float to native Python types.
+        # Check bool before int (bool is a subclass of int in Python).
+        if isinstance(val, bool):
+            return "boolean"
+        if isinstance(val, int):
+            return "int"
+        if isinstance(val, float):
+            return "float"
+        # Fallback for any value still exposed as a Java object.
+        try:
+            return {
+                "java.lang.Boolean": "boolean", "java.lang.Integer": "int",
+                "java.lang.Long": "long", "java.lang.Float": "float",
+            }.get(str(val.getClass().getName()))
+        except Exception:  # noqa: BLE001
+            return None
 
     def _reflect_type(self, name):
         c = self._cls()
