@@ -24,8 +24,10 @@ runs inside the app. Imports carry `# type: ignore` to silence the warning.
 
 ## Install (manual — always works)
 
+exteraGram plugin files use the `.plugin` extension (the content is plain Python).
+
 1. exteraGram → Settings → **exteraGram → Plugins** (enable the plugin system).
-2. Send `material_u.py` to any chat (e.g. Saved Messages) and open the file.
+2. Send `material_u.plugin` to any chat (e.g. Saved Messages) and open the file.
 3. Tap **Install**, then **Enable after installation**.
 4. Open the plugin settings (Plugins → Material U).
 
@@ -38,14 +40,12 @@ a manifest `extera-plugins.json`.
    `https://raw.githubusercontent.com/<owner>/<repo>/main/extera-plugins.json`
 2. Find "Material U" in the list → Install.
 
-> `sha256` / `size` in the manifest must match `material_u.py`. After any change,
+> `sha256` / `size` in the manifest must match `material_u.plugin`. After any change,
 > refresh them:
 > ```sh
-> shasum -a 256 material_u.py   # -> sha256
-> wc -c < material_u.py         # -> size
+> shasum -a 256 material_u.plugin   # -> sha256
+> wc -c < material_u.plugin         # -> size
 > ```
-> If the client requires a `.plugin` extension instead of `.py`, just change the
-> `file` field in the manifest; manual install of the `.py` always works.
 
 ## How to use
 
@@ -77,6 +77,6 @@ v1 deliberately does **not** guess modern field names. Instead:
 
 ## Files
 
-- `material_u.py` — the plugin.
+- `material_u.plugin` — the plugin (Python source; `.plugin` is the exteraGram extension).
 - `extera-plugins.json` — exteraGram repository manifest.
 - `README.md` — this file.
