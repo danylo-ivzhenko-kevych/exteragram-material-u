@@ -30,7 +30,7 @@ __description__ = (
     "показує, чи зміни реально зберігаються (результат у буфері + тост)."
 )
 __author__ = "Danylo"
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.0.0"
 __app_version__ = ">=11.0.0"
@@ -340,6 +340,30 @@ class MaterialUPlugin(BasePlugin):
         body = "\n".join(rows) if rows else f"(порожньо) помилка рефлексії: {err}"
         self._report(f"Поля ExteraConfig ({len(rows)})", body)
 
+    def _diag_summary(self, *_):
+        """Compact state of our target keys + whether the config class is reachable.
+        Tap this AFTER a restart to see if the values survived (revert diagnosis)."""
+        prefs = self._prefs()
+        c = self._cls()
+        lines = [f"ExteraConfig клас знайдено: {c is not None}",
+                 f"prefs: {'ok' if prefs is not None else 'НЕМА'}", ""]
+        keys = ["md3Styles", "forceBlur", "blurActionBar", "blurBottomPanel",
+                "blurDialogs", "glassMessageMenu", "glareOnElements", "forceSnow",
+                "squareFab"]
+        for k in keys:
+            try:
+                present = bool(prefs.contains(k))
+                val = prefs.getBoolean(k, False) if present else "(нема)"
+            except Exception as e:  # noqa: BLE001
+                present, val = "?", f"err {e}"
+            lines.append(f"{k} = {val}  (present={present})")
+        try:
+            lines.append(f"sectionRadius = {prefs.getFloat('sectionRadius', -1.0)}")
+        except Exception:  # noqa: BLE001
+            pass
+        text = f"Material U {__version__} — поточний стан\n\n" + "\n".join(lines)
+        self._report("Стан", text, summary="Поточний стан — у буфері")
+
     def _show_keys(self, *_):
         prefs = self._prefs()
         if prefs is None:
@@ -394,6 +418,8 @@ class MaterialUPlugin(BasePlugin):
             Divider(),
 
             Header(text="Діагностика"),
+            Text(text="🔁 Стан наших ключів (тисни після перезапуску)", icon="msg_info",
+                 on_click=self._diag_summary),
             Text(text="🧬 Поля ExteraConfig (назва: тип = значення)", icon="msg_info",
                  on_click=self._show_fields),
             Text(text="🔍 Усі збережені ключі", icon="msg_settings",
