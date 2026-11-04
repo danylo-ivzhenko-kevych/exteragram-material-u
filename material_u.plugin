@@ -1,23 +1,16 @@
 """
 Material U — Pixel clean UI for exteraGram.
 
-A thin "switcher" plugin: it does NOT hand-draw a new UI (that would be brittle
-and break on every app update). Instead it flips exteraGram's own appearance
-flags towards a flat, Material-You-friendly look (no liquid glass / blur, clean
-switches, optional system font) and ships a self-diagnostic that dumps the exact
-config keys present on THIS device/version — so the modern keys (liquid glass,
-Monet/dynamic colours, "islands") can be targeted precisely without ADB.
+A thin "switcher" plugin: it does NOT hand-draw a new UI (that would be brittle and
+break on every app update). Instead it flips exteraGram's own appearance flags toward a
+Material-You look (M3 on; liquid glass / blur / glare off) and ships a diagnostic that
+dumps the real config keys AND field types of THIS installed version.
 
-Config facts this relies on (from exteraSquad/exteraGram source,
-com/exteragram/messenger/ExteraConfig.java):
-  * all options live in SharedPreferences named "exteraconfig";
-  * `ExteraConfig.preferences` is a public static SharedPreferences;
-  * each option is a `public static` field whose name usually equals its pref key.
+Keys below were confirmed from a real device dump (exteraGram v12+). Writes are
+TYPE-SAFE: the field's declared Java type is read via reflection first, so we never
+store a boolean into an int key (which would crash the app on read).
 """
 
-# These modules are provided by the exteraGram runtime (Chaquopy) at runtime on the
-# device. They do not exist on a desktop, so editors flag them as unresolved — that is
-# expected and harmless; `# type: ignore` silences the warning.
 from base_plugin import BasePlugin  # type: ignore
 from hook_utils import find_class, get_static_private_field, set_static_private_field  # type: ignore
 from android_utils import run_on_ui_thread, log  # type: ignore
@@ -29,12 +22,11 @@ from typing import Any, List
 __id__ = "material_u"
 __name__ = "Material U — Pixel clean UI"
 __description__ = (
-    "Прибирає liquid glass / блюр та вирівнює вигляд exteraGram під Material You "
-    "(як на Google Pixel). Містить діагностику, що показує реальні ключі налаштувань "
-    "твоєї версії."
+    "Material You (M3) увімкнено, liquid glass / блюр / відблиски вимкнено. "
+    "Містить діагностику з реальними ключами й типами полів твоєї версії."
 )
 __author__ = "Danylo"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.0.0"
 __app_version__ = ">=11.0.0"
@@ -42,169 +34,201 @@ __sdk_version__ = ">=1.0.0"
 
 EXTERA_CONFIG = "com.exteragram.messenger.ExteraConfig"
 
-# Known boolean flags from the public source. Key == static field name.
-# `clean_value` is what a flat Material-You look wants.
-#   (None means "leave as-is" / handled elsewhere.)
-KNOWN_BOOL_FLAGS = {
-    "forceBlur": False,        # off => no glassy blur behind bars/menus
-    "newSwitchStyle": True,    # Material-style switches
-    "disableDividers": False,  # keep subtle dividers (Material groups use them)
-    "useSystemFonts": True,    # Roboto / device (Pixel) font
-    "squareFab": False,        # round FAB reads more Material
-    "centerTitle": False,      # Material = start-aligned titles
-}
+PRIMITIVES = {"boolean", "int", "long", "float", "double"}
 
-# Heuristics for discovering MODERN keys that the public source predates.
-# A discovered key whose name matches one of these substrings gets the paired
-# value when "Apply preset" runs. Case-insensitive.
-PRESET_HEURISTICS = [
-    # (substring, desired_value, why)
-    ("liquidglass", False, "liquid glass off"),
-    ("glass", False, "glass effects off"),
-    ("island", False, "settings islands off"),
-    ("blur", False, "blur off"),
-    ("monet", True, "Monet / dynamic colours on"),
-    ("dynamiccolor", True, "dynamic colours on"),
-    ("materialyou", True, "Material You on"),
+# Material-You preset, keyed by REAL field names from the device dump.
+# Value is the desired state; it is coerced to the field's actual type at write time.
+PRESET = [
+    ("md3Styles", True),         # master Material 3 styles
+    ("forceBlur", False),        # liquid glass blur off
+    ("blurActionBar", False),
+    ("blurBottomPanel", False),
+    ("blurDialogs", False),
+    ("glassMessageMenu", False), # liquid glass message menu off
+    ("glareOnElements", False),  # glass glare off
+    ("forceSnow", False),        # seasonal snow off
 ]
 
 
 class MaterialUPlugin(BasePlugin):
 
     # ------------------------------------------------------------------ config
-    def _config_class(self):
-        cls = find_class(EXTERA_CONFIG)
-        if cls is None:
-            self.logger.error("ExteraConfig class not found — wrong app/version?")
-        return cls
+    def _cls(self):
+        c = find_class(EXTERA_CONFIG)
+        if c is None:
+            self.logger.error("ExteraConfig not found — wrong app/version?")
+        return c
 
     def _prefs(self):
-        """Live SharedPreferences('exteraconfig') from the running app."""
-        cls = self._config_class()
-        if cls is None:
+        c = self._cls()
+        if c is None:
             return None
         try:
-            return get_static_private_field(cls, "preferences")
+            return get_static_private_field(c, "preferences")
         except Exception as e:  # noqa: BLE001
-            self.logger.exception(f"reading ExteraConfig.preferences failed: {e}")
+            self.logger.exception(f"reading preferences failed: {e}")
             return None
 
-    def _all_entries(self) -> List[tuple]:
-        """Return sorted (key, value) of every stored exteraGram option."""
-        prefs = self._prefs()
-        if prefs is None:
-            return []
-        out = []
+    def _field_type(self, name: str):
+        """Declared Java type of an ExteraConfig field, or None if absent here."""
+        c = self._cls()
+        if c is None:
+            return None
         try:
-            for entry in prefs.getAll().entrySet().toArray():
-                out.append((str(entry.getKey()), entry.getValue()))
-        except Exception as e:  # noqa: BLE001
-            self.logger.exception(f"getAll() failed: {e}")
-        out.sort(key=lambda kv: kv[0].lower())
-        return out
+            return str(c.getDeclaredField(name).getType().getName())
+        except Exception:  # noqa: BLE001
+            return None
 
-    def _get_bool(self, key: str, default: bool = False) -> bool:
-        prefs = self._prefs()
-        if prefs is None:
+    def _get_static(self, name: str, default=None):
+        c = self._cls()
+        if c is None:
             return default
         try:
-            return bool(prefs.getBoolean(key, default))
+            return get_static_private_field(c, name)
         except Exception:  # noqa: BLE001
             return default
 
-    def _put_bool(self, key: str, value: bool) -> bool:
-        """Persist a boolean flag AND update the live static field + refresh UI."""
-        cls = self._config_class()
+    def _get_bool(self, name: str, default: bool = False) -> bool:
+        val = self._get_static(name, None)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return val != 0
+        return default
+
+    def _set_flag(self, name: str, value) -> str:
+        """Type-safe write: pref + live static field. Returns ok / skip / error."""
+        c = self._cls()
         prefs = self._prefs()
-        if cls is None or prefs is None:
-            return False
-        ok = True
-        # 1) persist to disk so it survives restart and the app reads it on load
+        if c is None or prefs is None:
+            return "error"
+        ftype = self._field_type(name)
+        if ftype not in PRIMITIVES:
+            # field does not exist on this version — skip safely, never guess a type
+            return "skip"
         try:
-            prefs.edit().putBoolean(key, bool(value)).apply()
+            editor = prefs.edit()
+            if ftype == "boolean":
+                conv = bool(value)
+                editor.putBoolean(name, conv)
+            elif ftype == "int":
+                conv = int(value)
+                editor.putInt(name, conv)
+            elif ftype == "long":
+                conv = int(value)
+                editor.putLong(name, conv)
+            else:  # float / double
+                conv = float(value)
+                editor.putFloat(name, conv)
+            editor.apply()
         except Exception as e:  # noqa: BLE001
-            self.logger.exception(f"put '{key}' failed: {e}")
-            ok = False
-        # 2) update the in-memory static field so it takes effect without restart
-        #    (ExteraConfig.loadConfig() is guarded and won't re-read once loaded)
+            self.logger.exception(f"put '{name}' failed: {e}")
+            return "error"
         try:
-            set_static_private_field(cls, key, bool(value))
+            set_static_private_field(c, name, conv)
         except Exception as e:  # noqa: BLE001
-            # Field name may differ from pref key on newer versions — non-fatal.
-            self.logger.warning(f"static field '{key}' not updated live: {e}")
-        self._refresh_ui()
-        return ok
+            self.logger.warning(f"static '{name}' not live-updated: {e}")
+        return "ok"
 
     def _refresh_ui(self) -> None:
-        """Best-effort: nudge the app to redraw. Some changes still need reopen."""
         try:
             from client_utils import get_notification_center  # type: ignore
-            nc_cls = find_class("org.telegram.messenger.NotificationCenter")
-            event = get_static_private_field(nc_cls, "mainUserInfoChanged")
-            get_notification_center().postNotificationName(event, [])
+            nc = find_class("org.telegram.messenger.NotificationCenter")
+            get_notification_center().postNotificationName(
+                get_static_private_field(nc, "mainUserInfoChanged"), []
+            )
         except Exception as e:  # noqa: BLE001
-            self.logger.debug(f"UI refresh notification skipped: {e}")
+            self.logger.debug(f"refresh skipped: {e}")
 
     # --------------------------------------------------------------- lifecycle
     def on_plugin_load(self):
-        # Dump the real keys once at load so they're also in the plugin log.
         try:
-            entries = self._all_entries()
-            self.logger.info(f"Material U: {len(entries)} exteraGram keys discovered")
-            for k, v in entries:
-                self.logger.info(f"  {k} = {v!r}")
+            prefs = self._prefs()
+            n = len(prefs.getAll()) if prefs is not None else 0
+            self.logger.info(f"Material U loaded; {n} exteraGram keys present")
         except Exception as e:  # noqa: BLE001
-            self.logger.exception(f"startup dump failed: {e}")
+            self.logger.exception(f"load dump failed: {e}")
 
     # ----------------------------------------------------------------- actions
     def _apply_preset(self, *_):
-        changed = []
-        # 1) known flags from source
-        for key, want in KNOWN_BOOL_FLAGS.items():
-            if want is None:
-                continue
-            if self._get_bool(key, want) != want:
-                if self._put_bool(key, want):
-                    changed.append(f"{key} -> {want}")
-        # 2) modern keys discovered on THIS device, matched by heuristic
-        for key, value in self._all_entries():
-            if not isinstance(value, bool):
-                continue
-            lk = key.lower()
-            for sub, want, _why in PRESET_HEURISTICS:
-                if sub in lk and value != want:
-                    if self._put_bool(key, want):
-                        changed.append(f"{key} -> {want}")
-                    break
-        self._toast_result(changed)
-
-    def _toast_result(self, changed: List[str]):
-        if changed:
-            msg = "Застосовано Material You:\n\n• " + "\n• ".join(changed)
-            msg += "\n\nДеякі зміни видно після повторного відкриття екрана або перезапуску exteraGram."
-        else:
-            msg = ("Нічого не змінено — усе вже у чистому стані, або ключі твоєї версії "
-                   "не збіглися з евристикою. Відкрий «Показати всі ключі» і надішли список "
-                   "розробнику, щоб додати точні назви.")
+        applied, skipped = [], []
+        for name, want in PRESET:
+            res = self._set_flag(name, want)
+            if res == "ok":
+                applied.append(f"{name} -> {want}")
+            elif res == "skip":
+                skipped.append(name)
+        self._refresh_ui()
+        msg = ""
+        if applied:
+            msg += "Застосовано:\n• " + "\n• ".join(applied) + "\n\n"
+        if skipped:
+            msg += "Немає у цій версії (пропущено): " + ", ".join(skipped) + "\n\n"
+        msg += "⚠️ Повністю перезапусти exteraGram (змах із недавніх), щоб побачити зміни блюру/M3."
         self._show_dialog("Material U", msg)
 
+    def _toggle_sections_flat(self, flat: bool):
+        # Material "islands" rounding lives in sectionRadius (float). 0 = flat corners.
+        self._set_flag("sectionRadius", 0.0 if flat else 17.0)
+        self._refresh_ui()
+
+    def _changer(self, name: str):
+        def _cb(new_value: bool):
+            self._set_flag(name, bool(new_value))
+            self._refresh_ui()
+        return _cb
+
+    # -------------------------------------------------------------- diagnostics
     def _show_keys(self, *_):
-        entries = self._all_entries()
-        if not entries:
-            self._show_dialog("Material U", "Не вдалося прочитати налаштування exteraGram.")
+        prefs = self._prefs()
+        if prefs is None:
+            self._show_dialog("Material U", "Не вдалося прочитати налаштування.")
             return
-        lines = [f"{k} = {v!r}" for k, v in entries]
-        body = f"Знайдено {len(entries)} ключів у exteraconfig:\n\n" + "\n".join(lines)
-        self._show_dialog("Ключі exteraGram", body)
+        rows = []
+        try:
+            for e in prefs.getAll().entrySet().toArray():
+                v = e.getValue()
+                sv = repr(v)
+                if len(sv) > 80:
+                    sv = sv[:77] + "…"
+                rows.append(f"{e.getKey()} = {sv}")
+        except Exception as ex:  # noqa: BLE001
+            self.logger.exception(f"getAll failed: {ex}")
+        rows.sort(key=str.lower)
+        self._show_dialog(f"Ключі ({len(rows)})", "\n".join(rows))
+
+    def _show_fields(self, *_):
+        """Definitive list: every primitive ExteraConfig field as name: type = value."""
+        c = self._cls()
+        if c is None:
+            self._show_dialog("Material U", "ExteraConfig не знайдено.")
+            return
+        rows = []
+        try:
+            for f in c.getDeclaredFields():
+                tp = str(f.getType().getName())
+                if tp not in PRIMITIVES:
+                    continue
+                name = str(f.getName())
+                rows.append(f"{name}: {tp} = {self._get_static(name, '?')}")
+        except Exception as ex:  # noqa: BLE001
+            self.logger.exception(f"fields dump failed: {ex}")
+        rows.sort(key=str.lower)
+        self._show_dialog(f"Поля ExteraConfig ({len(rows)})", "\n".join(rows))
 
     def _copy_keys(self, *_):
-        entries = self._all_entries()
-        text = "\n".join(f"{k} = {v!r}" for k, v in entries)
+        prefs = self._prefs()
+        if prefs is None:
+            return
         try:
+            text = "\n".join(
+                f"{e.getKey()} = {e.getValue()!r}"
+                for e in prefs.getAll().entrySet().toArray()
+            )
             from android_utils import copy_to_clipboard  # type: ignore
             copy_to_clipboard(text)
-        except Exception as e:  # noqa: BLE001
-            self.logger.exception(f"clipboard failed: {e}")
+        except Exception as ex:  # noqa: BLE001
+            self.logger.exception(f"copy failed: {ex}")
 
     def _show_dialog(self, title: str, message: str):
         def _show():
@@ -213,71 +237,55 @@ class MaterialUPlugin(BasePlugin):
             if not activity:
                 log("Material U: no activity for dialog")
                 return
-            builder = AlertDialogBuilder(activity)
-            builder.set_title(title)
-            builder.set_message(message)
-            builder.set_positive_button("OK", lambda b, which: b.dismiss())
-            builder.show()
+            b = AlertDialogBuilder(activity)
+            b.set_title(title)
+            b.set_message(message or "—")
+            b.set_positive_button("OK", lambda d, w: d.dismiss())
+            b.show()
         run_on_ui_thread(_show)
 
     # ---------------------------------------------------------------- settings
-    def _bool_changer(self, key: str):
-        # returns an on_change(new_value) that writes straight to exteraGram config
-        def _cb(new_value: bool):
-            self._put_bool(key, bool(new_value))
-        return _cb
-
     def create_settings(self) -> List[Any]:
         return [
             Header(text="Material You"),
-            Text(
-                text="✨ Застосувати пресет Material You",
-                icon="msg_theme",
-                on_click=self._apply_preset,
-            ),
-            Divider(text="Вимикає скло/блюр та вмикає Monet, де це підтримує твоя версія."),
+            Text(text="✨ Застосувати пресет Material You", icon="msg_theme",
+                 on_click=self._apply_preset),
+            Divider(text="M3 увімк., скло/блюр/сніг вимк. Потрібен повний перезапуск exteraGram."),
 
-            Header(text="Швидкі перемикачі"),
-            Switch(
-                key="mu_forceBlur",
-                text="Примусовий блюр (liquid glass)",
-                default=self._get_bool("forceBlur", False),
-                icon="msg_photo_settings",
-                on_change=self._bool_changer("forceBlur"),
-            ),
-            Switch(
-                key="mu_newSwitchStyle",
-                text="Material-стиль перемикачів",
-                default=self._get_bool("newSwitchStyle", True),
-                icon="msg_settings",
-                on_change=self._bool_changer("newSwitchStyle"),
-            ),
-            Switch(
-                key="mu_useSystemFonts",
-                text="Системний шрифт (Roboto / Pixel)",
-                default=self._get_bool("useSystemFonts", True),
-                icon="msg_language",
-                on_change=self._bool_changer("useSystemFonts"),
-            ),
-            Switch(
-                key="mu_squareFab",
-                text="Квадратна кнопка (FAB)",
-                default=self._get_bool("squareFab", True),
-                icon="msg_edit",
-                on_change=self._bool_changer("squareFab"),
-            ),
+            Header(text="Material 3"),
+            Switch(key="mu_md3Styles", text="Material 3 стиль (M3)",
+                   default=self._get_bool("md3Styles", False), icon="msg_colors",
+                   on_change=self._changer("md3Styles")),
+            Switch(key="mu_sectionsFlat", text="Пласкі секції (без острівців)",
+                   default=(self._get_static("sectionRadius", 17.0) == 0),
+                   icon="msg_list", on_change=self._toggle_sections_flat),
+
+            Header(text="Прибрати liquid glass / блюр"),
+            Switch(key="mu_forceBlur", text="Примусовий блюр",
+                   default=self._get_bool("forceBlur", False), icon="msg_photo_settings",
+                   on_change=self._changer("forceBlur")),
+            Switch(key="mu_glassMessageMenu", text="Скляне меню повідомлень",
+                   default=self._get_bool("glassMessageMenu", False), icon="msg_message",
+                   on_change=self._changer("glassMessageMenu")),
+            Switch(key="mu_glareOnElements", text="Відблиски на елементах",
+                   default=self._get_bool("glareOnElements", False), icon="msg_bulb",
+                   on_change=self._changer("glareOnElements")),
+
+            Header(text="Інше"),
+            Switch(key="mu_forceSnow", text="Сніг",
+                   default=self._get_bool("forceSnow", False), icon="msg_photo_settings",
+                   on_change=self._changer("forceSnow")),
+            Switch(key="mu_squareFab", text="Квадратна кнопка (FAB)",
+                   default=self._get_bool("squareFab", True), icon="msg_edit",
+                   on_change=self._changer("squareFab")),
             Divider(),
 
-            Header(text="Діагностика (знайти точні ключі)"),
-            Text(
-                text="🔍 Показати всі ключі exteraGram",
-                icon="msg_info",
-                on_click=self._show_keys,
-            ),
-            Text(
-                text="📋 Скопіювати ключі в буфер",
-                icon="msg_copy",
-                on_click=self._copy_keys,
-            ),
-            Divider(text="Надішли цей список, щоб додати точні назви liquid glass / островців / Monet."),
+            Header(text="Діагностика"),
+            Text(text="🧬 Поля ExteraConfig (назва: тип = значення)", icon="msg_info",
+                 on_click=self._show_fields),
+            Text(text="🔍 Усі збережені ключі", icon="msg_settings",
+                 on_click=self._show_keys),
+            Text(text="📋 Скопіювати ключі в буфер", icon="msg_copy",
+                 on_click=self._copy_keys),
+            Divider(text="Надішли «Поля ExteraConfig», щоб доточити острівці/вкладки точно."),
         ]

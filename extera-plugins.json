@@ -5,10 +5,10 @@
     {
       "id": "material_u",
       "name": "Material U — Pixel clean UI",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "file": "material_u.plugin",
-      "sha256": "a7284cbfed76d6327c8759d6c065a7013d127e347ed1b9d72ab2a387f5f138e7",
-      "size": 12695
+      "sha256": "193081740ff177271058107a5edf7d92d07db093140ff697271e79c8f951b7d5",
+      "size": 12597
     }
   ]
 }
