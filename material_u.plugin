@@ -5,18 +5,21 @@ A thin "switcher" plugin: it does NOT hand-draw a new UI (too brittle). It flips
 exteraGram's own appearance flags toward a Material-You look (M3 on; liquid glass /
 blur / glare off) and ships diagnostics that read the real config of THIS device.
 
-v1.2.0 — writes are now SELF-VERIFYING: every write reads the value back and the
-result dialog shows `wrote -> now`, so we can see on-device whether persistence works.
-Prefs are taken from the app Context (ApplicationLoader) for reliability, and field
-types are resolved from Java reflection first, then the stored value's class, then a
-known map — so we never store the wrong type into a key (which could crash the app).
+v1.3.0
+  * Reliable feedback: results go to a Bulletin toast AND the clipboard (both proven
+    to work). The AlertDialog is best-effort only and can never break a button.
+  * Writes are SELF-VERIFYING: commit() then read the value back; the self-test report
+    shows `type / wrote / commit / now` per key so persistence is visible on-device.
+  * Settings switches are synced to the LIVE exteraGram config on open, so they show
+    the real state (not the plugin's own stored mirror).
+  * Type-safe writes: field type resolved from reflection, then the stored value's
+    class, then a known map — never store the wrong type into a key.
 """
 
 from base_plugin import BasePlugin  # type: ignore
 from hook_utils import find_class, get_static_private_field, set_static_private_field  # type: ignore
 from android_utils import run_on_ui_thread, log  # type: ignore
 from client_utils import get_last_fragment  # type: ignore
-from ui.alert import AlertDialogBuilder  # type: ignore
 from ui.settings import Header, Switch, Text, Divider  # type: ignore
 from typing import Any, List
 
@@ -24,10 +27,10 @@ __id__ = "material_u"
 __name__ = "Material U — Pixel clean UI"
 __description__ = (
     "Material You (M3) увімк., liquid glass / блюр / відблиски вимк. Самотест запису "
-    "показує, чи зміни реально зберігаються."
+    "показує, чи зміни реально зберігаються (результат у буфері + тост)."
 )
 __author__ = "Danylo"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.0.0"
 __app_version__ = ">=11.0.0"
@@ -39,21 +42,14 @@ PRIMITIVES = {"boolean", "int", "long", "float", "double"}
 
 # Fallback type map (used only if reflection + stored-value typing both fail).
 TYPE_MAP = {
-    "md3Styles": "boolean",
-    "forceBlur": "boolean",
-    "forceSnow": "boolean",
-    "glassMessageMenu": "boolean",
-    "glareOnElements": "boolean",
-    "blurActionBar": "boolean",
-    "blurBottomPanel": "boolean",
-    "blurDialogs": "boolean",
-    "squareFab": "boolean",
-    "glassOutlineStyle": "int",
-    "sectionRadius": "float",
-    "avatarCorners": "float",
+    "md3Styles": "boolean", "forceBlur": "boolean", "forceSnow": "boolean",
+    "glassMessageMenu": "boolean", "glareOnElements": "boolean",
+    "blurActionBar": "boolean", "blurBottomPanel": "boolean",
+    "blurDialogs": "boolean", "squareFab": "boolean",
+    "glassOutlineStyle": "int", "sectionRadius": "float", "avatarCorners": "float",
 }
 
-# Material-You preset, keyed by REAL field names from the device dump.
+# Material-You preset, keyed by REAL field names confirmed from a device dump.
 PRESET = [
     ("md3Styles", True),
     ("forceBlur", False),
@@ -63,6 +59,16 @@ PRESET = [
     ("glassMessageMenu", False),
     ("glareOnElements", False),
     ("forceSnow", False),
+]
+
+# Switches shown in settings: (plugin_key, real_config_key, title, icon, default)
+SWITCHES = [
+    ("mu_md3Styles", "md3Styles", "Material 3 стиль (M3)", "msg_colors", False),
+    ("mu_forceBlur", "forceBlur", "Примусовий блюр", "msg_photo_settings", False),
+    ("mu_glassMessageMenu", "glassMessageMenu", "Скляне меню повідомлень", "msg_message", False),
+    ("mu_glareOnElements", "glareOnElements", "Відблиски на елементах", "msg_bulb", False),
+    ("mu_forceSnow", "forceSnow", "Сніг", "msg_photo_settings", False),
+    ("mu_squareFab", "squareFab", "Квадратна кнопка (FAB)", "msg_edit", True),
 ]
 
 
@@ -94,13 +100,10 @@ class MaterialUPlugin(BasePlugin):
             return None
         if val is None:
             return None
-        cn = str(val.getClass().getName())
         return {
-            "java.lang.Boolean": "boolean",
-            "java.lang.Integer": "int",
-            "java.lang.Long": "long",
-            "java.lang.Float": "float",
-        }.get(cn)
+            "java.lang.Boolean": "boolean", "java.lang.Integer": "int",
+            "java.lang.Long": "long", "java.lang.Float": "float",
+        }.get(str(val.getClass().getName()))
 
     def _reflect_type(self, name):
         c = self._cls()
@@ -112,7 +115,6 @@ class MaterialUPlugin(BasePlugin):
             return None
 
     def _type_of(self, prefs, name):
-        # reflection is authoritative; then stored value's class; then known map
         return (self._reflect_type(name)
                 or self._stored_type(prefs, name)
                 or TYPE_MAP.get(name))
@@ -127,6 +129,14 @@ class MaterialUPlugin(BasePlugin):
             return default
 
     def _get_bool(self, name, default=False):
+        # prefer the live stored pref, fall back to the static field
+        prefs = self._prefs()
+        if prefs is not None:
+            try:
+                if prefs.contains(name):
+                    return bool(prefs.getBoolean(name, default))
+            except Exception:  # noqa: BLE001
+                pass
         val = self._get_static(name, None)
         if isinstance(val, bool):
             return val
@@ -135,7 +145,7 @@ class MaterialUPlugin(BasePlugin):
         return default
 
     def _set_flag(self, name, value):
-        """Type-safe write + read-back. Returns a dict for the self-test dialog."""
+        """Type-safe write + commit + read-back. Returns a result dict."""
         prefs = self._prefs()
         if prefs is None:
             return {"name": name, "status": "no-prefs"}
@@ -145,22 +155,17 @@ class MaterialUPlugin(BasePlugin):
         try:
             editor = prefs.edit()
             if ftype == "boolean":
-                conv = bool(value)
-                editor.putBoolean(name, conv)
+                conv = bool(value); editor.putBoolean(name, conv)
             elif ftype == "int":
-                conv = int(value)
-                editor.putInt(name, conv)
+                conv = int(value); editor.putInt(name, conv)
             elif ftype == "long":
-                conv = int(value)
-                editor.putLong(name, conv)
+                conv = int(value); editor.putLong(name, conv)
             else:
-                conv = float(value)
-                editor.putFloat(name, conv)
-            editor.commit()  # commit (sync) so read-back below is accurate
+                conv = float(value); editor.putFloat(name, conv)
+            committed = bool(editor.commit())
         except Exception as e:  # noqa: BLE001
             self.logger.exception(f"put '{name}' failed: {e}")
             return {"name": name, "status": f"error {e}"}
-        # read back from prefs
         try:
             if ftype == "boolean":
                 now = prefs.getBoolean(name, not conv)
@@ -172,16 +177,14 @@ class MaterialUPlugin(BasePlugin):
                 now = prefs.getFloat(name, -999999.0)
         except Exception:  # noqa: BLE001
             now = "?"
-        # live static field so it also affects the running session
         c = self._cls()
         if c is not None:
             try:
                 set_static_private_field(c, name, conv)
             except Exception as e:  # noqa: BLE001
                 self.logger.warning(f"static '{name}' not updated: {e}")
-        ok = (now == conv)
-        return {"name": name, "type": ftype, "wrote": conv, "now": now,
-                "status": "ok" if ok else "MISMATCH"}
+        return {"name": name, "type": ftype, "wrote": conv, "commit": committed,
+                "now": now, "status": "ok" if now == conv else "MISMATCH"}
 
     def _refresh_ui(self):
         try:
@@ -191,6 +194,58 @@ class MaterialUPlugin(BasePlugin):
                 get_static_private_field(nc, "mainUserInfoChanged"), [])
         except Exception as e:  # noqa: BLE001
             self.logger.debug(f"refresh skipped: {e}")
+
+    # ----------------------------------------------------------------- feedback
+    def _bulletin(self, msg, kind="info"):
+        try:
+            from ui.bulletin import BulletinHelper  # type: ignore
+            f = get_last_fragment()
+            if kind == "success":
+                BulletinHelper.show_success(msg, f)
+            elif kind == "error":
+                BulletinHelper.show_error(msg, f)
+            else:
+                BulletinHelper.show_info(msg, f)
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.logger.debug(f"bulletin failed: {e}")
+            return False
+
+    def _copy(self, text):
+        try:
+            from android_utils import copy_to_clipboard  # type: ignore
+            copy_to_clipboard(text)
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.logger.exception(f"clipboard failed: {e}")
+            return False
+
+    def _dialog(self, title, message):
+        """Best-effort dialog; wrapped so it can never break the caller."""
+        def _show():
+            try:
+                from ui.alert import AlertDialogBuilder  # type: ignore
+                f = get_last_fragment()
+                act = f.getParentActivity() if f else None
+                if not act:
+                    return
+                b = AlertDialogBuilder(act)
+                b.set_title(title)
+                b.set_message(message or "—")
+                b.set_positive_button("OK", lambda d, w: d.dismiss())
+                b.create()
+                b.set_cancelable(True)
+                b.show()
+            except Exception as e:  # noqa: BLE001
+                log(f"Material U dialog failed: {e}")
+        run_on_ui_thread(_show)
+
+    def _report(self, title, text, summary=None):
+        """Show a bulletin summary, copy full text to clipboard, try a dialog."""
+        copied = self._copy(text)
+        tail = "скопійовано в буфер" if copied else "див. лог"
+        self._bulletin(summary or f"{title}: {tail}", "success" if copied else "error")
+        self._dialog(title, text)
 
     # --------------------------------------------------------------- lifecycle
     def on_plugin_load(self):
@@ -205,35 +260,45 @@ class MaterialUPlugin(BasePlugin):
     def _apply_preset(self, *_):
         results = [self._set_flag(n, v) for n, v in PRESET]
         self._refresh_ui()
-        lines = []
+        lines, nok, nbad, nskip = [], 0, 0, 0
         for r in results:
-            if r["status"] == "ok":
-                lines.append(f"✓ {r['name']}: → {r['wrote']}")
-            elif r["status"] == "MISMATCH":
-                lines.append(f"✗ {r['name']}: записав {r['wrote']}, читається {r['now']}")
+            st = r["status"]
+            if st == "ok":
+                nok += 1
+                lines.append(f"✓ {r['name']}: {r['type']} = {r['wrote']}")
+            elif st == "MISMATCH":
+                nbad += 1
+                lines.append(f"✗ {r['name']}: записав {r['wrote']}, читається {r['now']} "
+                             f"(commit={r['commit']})")
             else:
-                lines.append(f"• {r['name']}: {r['status']}")
-        msg = ("САМОТЕСТ ЗАПИСУ (✓ = збережено, ✗ = не зберігається, "
-               "• = поля нема/помилка):\n\n" + "\n".join(lines) +
-               "\n\n⚠️ Якщо всюди ✓ — повністю перезапусти exteraGram, щоб побачити UI.\n"
-               "Якщо є ✗ або • — надішли цей екран, лагодитиму запис.")
-        self._show_dialog("Material U — self-test", msg)
+                nskip += 1
+                lines.append(f"• {r['name']}: {st}")
+        text = (f"Material U {__version__} — самотест запису\n"
+                f"✓збережено={nok}  ✗не збереглось={nbad}  •пропущено={nskip}\n\n"
+                + "\n".join(lines) +
+                "\n\nЯкщо всюди ✓ — повністю перезапусти exteraGram, щоб побачити UI.\n"
+                "Якщо є ✗/• — надішли цей текст.")
+        self._report("Самотест", text, summary=f"Самотест: ✓{nok} ✗{nbad} •{nskip} — у буфері")
 
     def _toggle_sections_flat(self, flat):
-        self._set_flag("sectionRadius", 0.0 if flat else 17.0)
+        r = self._set_flag("sectionRadius", 0.0 if flat else 17.0)
         self._refresh_ui()
+        self._bulletin(f"Секції: {r.get('status', '?')} (перезапусти застосунок)",
+                       "success" if r.get("status") == "ok" else "error")
 
     def _changer(self, name):
         def _cb(new_value):
-            self._set_flag(name, bool(new_value))
+            r = self._set_flag(name, bool(new_value))
             self._refresh_ui()
+            self._bulletin(f"{name} = {r.get('now', '?')} ({r.get('status', '?')})",
+                           "success" if r.get("status") == "ok" else "error")
         return _cb
 
     # -------------------------------------------------------------- diagnostics
     def _show_fields(self, *_):
         c = self._cls()
         if c is None:
-            self._show_dialog("Material U", "ExteraConfig не знайдено.")
+            self._report("Поля", "ExteraConfig не знайдено.")
             return
         rows, err = [], None
         try:
@@ -247,13 +312,13 @@ class MaterialUPlugin(BasePlugin):
             err = str(ex)
             self.logger.exception(f"fields dump failed: {ex}")
         rows.sort(key=str.lower)
-        body = "\n".join(rows) if rows else f"(порожньо) помилка: {err}"
-        self._show_dialog(f"Поля ExteraConfig ({len(rows)})", body)
+        body = "\n".join(rows) if rows else f"(порожньо) помилка рефлексії: {err}"
+        self._report(f"Поля ExteraConfig ({len(rows)})", body)
 
     def _show_keys(self, *_):
         prefs = self._prefs()
         if prefs is None:
-            self._show_dialog("Material U", "Не вдалося прочитати налаштування.")
+            self._report("Ключі", "Не вдалося прочитати налаштування.")
             return
         rows = []
         try:
@@ -265,43 +330,28 @@ class MaterialUPlugin(BasePlugin):
         except Exception as ex:  # noqa: BLE001
             self.logger.exception(f"getAll failed: {ex}")
         rows.sort(key=str.lower)
-        self._show_dialog(f"Ключі ({len(rows)})", "\n".join(rows))
-
-    def _copy_keys(self, *_):
-        prefs = self._prefs()
-        if prefs is None:
-            return
-        try:
-            text = "\n".join(f"{e.getKey()} = {e.getValue()!r}"
-                             for e in prefs.getAll().entrySet().toArray())
-            from android_utils import copy_to_clipboard  # type: ignore
-            copy_to_clipboard(text)
-        except Exception as ex:  # noqa: BLE001
-            self.logger.exception(f"copy failed: {ex}")
-
-    def _show_dialog(self, title, message):
-        def _show():
-            fragment = get_last_fragment()
-            activity = fragment.getParentActivity() if fragment else None
-            if not activity:
-                log("Material U: no activity for dialog")
-                return
-            b = AlertDialogBuilder(activity)
-            b.set_title(title)
-            b.set_message(message or "—")
-            b.set_positive_button("OK", lambda d, w: d.dismiss())
-            b.show()
-        run_on_ui_thread(_show)
+        self._report(f"Ключі ({len(rows)})", "\n".join(rows))
 
     # ---------------------------------------------------------------- settings
+    def _sync_switches(self):
+        """Mirror live config into the plugin's own switch storage so the UI is honest."""
+        try:
+            for pkey, ckey, _t, _i, default in SWITCHES:
+                self.set_setting(pkey, self._get_bool(ckey, default), False)
+            self.set_setting("mu_sectionsFlat",
+                             self._get_static("sectionRadius", 17.0) == 0, False)
+        except Exception as e:  # noqa: BLE001
+            self.logger.debug(f"switch sync skipped: {e}")
+
     def create_settings(self) -> List[Any]:
-        return [
+        self._sync_switches()
+        items: List[Any] = [
             Header(text="Material You"),
             Text(text="✨ Застосувати пресет (самотест)", icon="msg_theme",
                  on_click=self._apply_preset),
-            Divider(text="Пише ключі й одразу перевіряє. Потім повний перезапуск exteraGram."),
+            Divider(text="Пише ключі, перевіряє, кладе звіт у буфер. Потім повний перезапуск."),
 
-            Header(text="Material 3"),
+            Header(text="Material 3 / острівці"),
             Switch(key="mu_md3Styles", text="Material 3 стиль (M3)",
                    default=self._get_bool("md3Styles", False), icon="msg_colors",
                    on_change=self._changer("md3Styles")),
@@ -310,16 +360,14 @@ class MaterialUPlugin(BasePlugin):
                    icon="msg_list", on_change=self._toggle_sections_flat),
 
             Header(text="Прибрати liquid glass / блюр"),
-            Switch(key="mu_forceBlur", text="Примусовий блюр",
-                   default=self._get_bool("forceBlur", False), icon="msg_photo_settings",
-                   on_change=self._changer("forceBlur")),
-            Switch(key="mu_glassMessageMenu", text="Скляне меню повідомлень",
-                   default=self._get_bool("glassMessageMenu", False), icon="msg_message",
-                   on_change=self._changer("glassMessageMenu")),
-            Switch(key="mu_glareOnElements", text="Відблиски на елементах",
-                   default=self._get_bool("glareOnElements", False), icon="msg_bulb",
-                   on_change=self._changer("glareOnElements")),
-
+        ]
+        for pkey, ckey, title, icon, default in SWITCHES:
+            if ckey in ("md3Styles", "squareFab", "forceSnow"):
+                continue  # placed in their own sections below
+            items.append(Switch(key=pkey, text=title,
+                                 default=self._get_bool(ckey, default), icon=icon,
+                                 on_change=self._changer(ckey)))
+        items += [
             Header(text="Інше"),
             Switch(key="mu_forceSnow", text="Сніг",
                    default=self._get_bool("forceSnow", False), icon="msg_photo_settings",
@@ -334,6 +382,5 @@ class MaterialUPlugin(BasePlugin):
                  on_click=self._show_fields),
             Text(text="🔍 Усі збережені ключі", icon="msg_settings",
                  on_click=self._show_keys),
-            Text(text="📋 Скопіювати ключі в буфер", icon="msg_copy",
-                 on_click=self._copy_keys),
         ]
+        return items
