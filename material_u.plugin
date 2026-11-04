@@ -31,7 +31,7 @@ __description__ = (
     "показує, чи зміни реально зберігаються (результат у буфері + тост)."
 )
 __author__ = "Danylo"
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.0.0"
 __app_version__ = ">=11.0.0"
@@ -58,6 +58,18 @@ PRESET = [
     ("blurBottomPanel", False),
     ("blurDialogs", False),
     ("glassMessageMenu", False),
+    ("glareOnElements", False),
+    ("forceSnow", False),
+]
+
+# Live preset — ONLY real top-level keys proven to exist in the prefs dump.
+# Applied the way exteraGram's own toggles do: pref write + static field + UI rebuild.
+LIVE_PRESET = [
+    ("sectionRadius", 0.0),     # flat sections (no rounded islands)
+    ("forceBlur", False),
+    ("blurActionBar", False),
+    ("blurBottomPanel", False),
+    ("blurDialogs", False),
     ("glareOnElements", False),
     ("forceSnow", False),
 ]
@@ -306,6 +318,55 @@ class MaterialUPlugin(BasePlugin):
             self._copy(f"Material U preset error: {e}")
             self._bulletin(f"Помилка пресету: {e}", "error")
 
+    def _set_static(self, name, value):
+        """Update the in-memory static field (like the app's own toggle does)."""
+        c = self._cls()
+        if c is None:
+            return "no-class"
+        try:
+            return bool(set_static_private_field(c, name, value))
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(f"set_static '{name}' failed: {e}")
+            return f"err {e}"
+
+    def _rebuild_ui(self):
+        """Rebuild all fragment views like exteraGram does after an appearance change."""
+        def _do():
+            try:
+                f = get_last_fragment()
+                pl = f.getParentLayout() if f else None
+                if pl is not None:
+                    pl.rebuildAllFragmentViews(True, True)
+                    return
+            except Exception as e:  # noqa: BLE001
+                log(f"rebuild failed: {e}")
+            try:  # fallback: recreate the whole activity
+                f = get_last_fragment()
+                act = f.getParentActivity() if f else None
+                if act:
+                    act.recreate()
+            except Exception as e:  # noqa: BLE001
+                log(f"recreate failed: {e}")
+        run_on_ui_thread(_do)
+
+    def _apply_live(self, *_):
+        """Apply real keys live: pref + static field + UI rebuild (no restart)."""
+        try:
+            lines = []
+            for name, want in LIVE_PRESET:
+                r = self._set_flag(name, want)                 # pref write + read-back
+                ss = self._set_static(name, want)              # in-memory field
+                lines.append(f"{name}: pref={r.get('status')} static={ss}")
+            self._rebuild_ui()
+            text = ("Material U — застосовано наживо (set static + rebuild):\n\n"
+                    + "\n".join(lines) +
+                    "\n\nЯкщо вигляд змінився одразу — механізм працює. "
+                    "Якщо static=err — поля в пам'ять не пишуться, лишається перезапуск.")
+            self._report("Наживо", text, summary="Наживо застосовано — див. буфер")
+        except Exception as e:  # noqa: BLE001
+            self.logger.exception(f"apply_live failed: {e}")
+            self._bulletin(f"Помилка: {e}", "error")
+
     def _toggle_sections_flat(self, flat):
         r = self._set_flag("sectionRadius", 0.0 if flat else 17.0)
         self._refresh_ui()
@@ -426,11 +487,13 @@ class MaterialUPlugin(BasePlugin):
     def create_settings(self) -> List[Any]:
         items: List[Any] = [
             Header(text="Material You"),
+            Text(text="⚡ Застосувати наживо (без перезапуску)", icon="msg_theme",
+                 on_click=self._apply_live),
             Text(text="🔔 Перевірити (тост + буфер)", icon="msg_info",
                  on_click=self._selftest_feedback),
-            Text(text="✨ Застосувати пресет (самотест)", icon="msg_theme",
+            Text(text="✨ Застосувати пресет (самотест)", icon="msg_colors",
                  on_click=self._apply_preset),
-            Divider(text="Спершу тисни «Перевірити»: має зʼявитись тост і текст у буфері."),
+            Divider(text="«Наживо» = одразу перемальовує екран, як рідний тумблер Appearance."),
 
             Header(text="Material 3 / острівці"),
             Switch(key="mu_md3Styles", text="Material 3 стиль (M3)",
