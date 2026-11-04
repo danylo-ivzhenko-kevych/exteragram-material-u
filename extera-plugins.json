@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "name": "Material U — Pixel clean UI",
+  "plugins": [
+    {
+      "id": "material_u",
+      "name": "Material U — Pixel clean UI",
+      "version": "1.0.0",
+      "file": "material_u.py",
+      "sha256": "a7284cbfed76d6327c8759d6c065a7013d127e347ed1b9d72ab2a387f5f138e7",
+      "size": 12695
+    }
+  ]
+}
